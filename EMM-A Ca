@@ -8,6 +8,9 @@ const string PATHFINDER_CHANNEL = "EMM-A Ca_PathFinder_Channel";
 const string REMOTE_NAME = "EMM-A Ca Remote Control";
 const string CONNECTOR_NAME = "EMM-A Ca Connector";
 const string ASTEROID_DB_PREFIX = "EMM-A Ca ";
+const string ACTIVE_SECTION = "Runtime";
+const string ACTIVE_DB_KEY = "ActiveAsteroidDB";
+const string ACTIVE_ASTEROID_KEY = "ActiveAsteroidSection";
 
 // Lists for asteroid databases and LCDs
 List<IMyTimerBlock> asteroidDatabases = new List<IMyTimerBlock>();
@@ -150,6 +153,16 @@ public void Main(string argument, UpdateType updateSource)
         if (parts.Length == 2 && int.TryParse(parts[1], out radius))
             SetFieldOnCurrent("ExclusionZone", radius.ToString());
         else Echo("Invalid exclusion zone format.");
+        return;
+    }
+    else if (argument.StartsWith("SetActiveAsteroid=", StringComparison.OrdinalIgnoreCase))
+    {
+        SetActiveAsteroid(argument.Substring("SetActiveAsteroid=".Length));
+        return;
+    }
+    else if (argument.Equals("ClearActiveAsteroid", StringComparison.OrdinalIgnoreCase))
+    {
+        ClearActiveAsteroid();
         return;
     }
     else if (argument.StartsWith("Ore", StringComparison.OrdinalIgnoreCase))
@@ -643,6 +656,104 @@ bool GetCurrentAsteroidIni(out MyIni ini, out string section)
     return false;
 }
 
+bool GetSelectedAsteroidIni(out MyIni ini, out string section)
+{
+    string activeDbName, activeSection;
+    if (TryGetActiveAsteroidRef(out activeDbName, out activeSection))
+    {
+        MyIni activeIni;
+        if (TryGetAsteroidIniByRef(activeDbName, activeSection, out activeIni))
+        {
+            ini = activeIni;
+            section = activeSection;
+            return true;
+        }
+    }
+    return GetCurrentAsteroidIni(out ini, out section);
+}
+
+bool TryGetAsteroidIniByRef(string dbName, string section, out MyIni ini)
+{
+    ini = null;
+    foreach (var db in asteroidDatabases)
+    {
+        if (!db.CustomName.Equals(dbName, StringComparison.OrdinalIgnoreCase)) continue;
+        MyIni t = new MyIni();
+        t.TryParse(db.CustomData);
+        if (!t.ContainsSection(section)) return false;
+        ini = t;
+        return true;
+    }
+    return false;
+}
+
+bool TryGetActiveAsteroidRef(out string dbName, out string section)
+{
+    dbName = "";
+    section = "";
+    if (fieldDatabase == null) return false;
+    MyIni ini = new MyIni();
+    if (!ini.TryParse(fieldDatabase.CustomData)) return false;
+    dbName = ini.Get(ACTIVE_SECTION, ACTIVE_DB_KEY).ToString();
+    section = ini.Get(ACTIVE_SECTION, ACTIVE_ASTEROID_KEY).ToString();
+    return !string.IsNullOrWhiteSpace(dbName) && !string.IsNullOrWhiteSpace(section);
+}
+
+void SetActiveAsteroid(string refText)
+{
+    if (fieldDatabase == null) { Echo("Field DB missing."); return; }
+    string dbName = "";
+    string section = "";
+    var parts = refText.Split('|');
+    if (parts.Length >= 2)
+    {
+        dbName = parts[0].Trim();
+        section = parts[1].Trim();
+    }
+    else
+    {
+        section = refText.Trim();
+        foreach (var db in asteroidDatabases)
+        {
+            MyIni iniCheck = new MyIni();
+            iniCheck.TryParse(db.CustomData);
+            if (iniCheck.ContainsSection(section))
+            {
+                dbName = db.CustomName;
+                break;
+            }
+        }
+    }
+    if (string.IsNullOrWhiteSpace(dbName) || string.IsNullOrWhiteSpace(section))
+    {
+        Echo("SetActiveAsteroid format: SetActiveAsteroid=<DBName>|<AsteroidN> (or just <AsteroidN> if unique)");
+        return;
+    }
+    MyIni verifyIni;
+    if (!TryGetAsteroidIniByRef(dbName, section, out verifyIni))
+    {
+        Echo("Active asteroid ref not found.");
+        return;
+    }
+    MyIni fieldIni = new MyIni();
+    fieldIni.TryParse(fieldDatabase.CustomData);
+    fieldIni.Set(ACTIVE_SECTION, ACTIVE_DB_KEY, dbName);
+    fieldIni.Set(ACTIVE_SECTION, ACTIVE_ASTEROID_KEY, section);
+    fieldDatabase.CustomData = fieldIni.ToString();
+    Echo($"Active asteroid set: {dbName}|{section}");
+}
+
+void ClearActiveAsteroid()
+{
+    if (fieldDatabase == null) return;
+    MyIni fieldIni = new MyIni();
+    if (!fieldIni.TryParse(fieldDatabase.CustomData)) return;
+    fieldIni.Delete(ACTIVE_SECTION, ACTIVE_DB_KEY);
+    fieldIni.Delete(ACTIVE_SECTION, ACTIVE_ASTEROID_KEY);
+    fieldDatabase.CustomData = fieldIni.ToString();
+    Echo("Active asteroid cleared.");
+}
+
 // Saves changes to the current asteroid setup
 void SetCurrentAsteroidIni(MyIni ini, string section)
 {
@@ -773,7 +884,7 @@ bool TryBuildReturnPathRoute(out string route)
 {
     route = "";
     MyIni ini; string section;
-    if (!GetCurrentAsteroidIni(out ini, out section)) { Echo("No asteroid setup."); return false; }
+    if (!GetSelectedAsteroidIni(out ini, out section)) { Echo("No selected asteroid."); return false; }
     int n = Math.Max(1, currentSiteN - 1);
     if (!ini.ContainsKey(section, $"ExcavationSite{n}") &&
         !ini.ContainsKey(section, $"ExcavationSiteStagger{n}") &&
