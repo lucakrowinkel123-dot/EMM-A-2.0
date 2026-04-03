@@ -340,10 +340,10 @@ void PrintDebugState()
     if (recordingActive) states.Add(recordingPaused ? "RecordingPaused" : "Recording");
     if (states.Count == 0) states.Add("Idle");
     string txt =
-        $"State: {string.Join(\", \", states)}\n" +
+        $"State: {string.Join(", ", states)}\n" +
         $"SetupStep: {setupStep}\n" +
         $"PathIdx: {autominePathIndex}/{pathGPS.Count}\n" +
-        $"Entry1: {(hasEntry1Target ? \"Yes\" : \"No\")}, Connector: {(hasLiveConnectorTarget ? \"Yes\" : \"No\")}\n" +
+        $"Entry1: {(hasEntry1Target ? "Yes" : "No")}, Connector: {(hasLiveConnectorTarget ? "Yes" : "No")}\n" +
         $"Thrusters: {cachedThrusters.Count}, Gyros: {cachedGyros.Count}\n" +
         $"Runtime: {Runtime.LastRunTimeMs:0.000} ms";
     Echo(txt);
