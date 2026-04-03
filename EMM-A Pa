@@ -6,6 +6,8 @@ const string SENSOR_TAG = "EMM-A PF Sensor"; // Ensure your sensor has this name
 const string PATHFINDER_CHANNEL = "EMM-A Ca_PathFinder_Channel"; 
 const string REMOTE_TAG = "EMM-A PF Remote Control"; 
 const string CONNECTOR_TAG = "EMM-A PF Connector";
+const string SNAPSHOT_SECTION = "PFPathCache";
+const string SNAPSHOT_PATH_KEY = "PathMessage";
 const double CLOSE_ENOUGH_DEFAULT = 1.0; 
 
 // PID TUNING FOR STABILITY
@@ -228,6 +230,7 @@ public void Main(string argument, UpdateType updateSource) {
             if (str != null) { 
                 if (str.StartsWith("Confirmed_Entry|")) HandleConfirmedEntry(str); 
                 else if (str.StartsWith("Path|")) HandlePathMessage(str); 
+                else if (str.StartsWith("ActiveAsteroidSnapshot|")) HandleAsteroidSnapshotMessage(str);
                 else if (str.StartsWith("PathfinderMaxSpeed|")) HandleMaxSpeed(str); 
                 else if (str.StartsWith("LiveDockData|")) HandleLiveDockData(str);
             } 
@@ -440,6 +443,12 @@ void HandlePathMessage(string msg) {
         if (idx < parts.Length && double.TryParse(parts[idx], out closeEnough)) { pathCloseEnoughs.Add(closeEnough); idx++; } else { pathCloseEnoughs.Add(CLOSE_ENOUGH_DEFAULT); } 
     } 
     pathMaxSpeed = -1; BroadcastCarrier("PathfinderMaxSpeedRequest"); Echo("Path stored."); 
+    SavePathSnapshotToCustomData(msg);
+    ActivateAutomineIfPathReady();
+} 
+
+void ActivateAutomineIfPathReady()
+{
     if (autominePendingPath && pathGPS.Count > 0) {
         autominePendingPath = false;
         bool firstIsEntry = pathGPSStrings.Count > 0 && pathGPSStrings[0].StartsWith("GPS:Entry:", StringComparison.OrdinalIgnoreCase);
@@ -452,14 +461,44 @@ void HandlePathMessage(string msg) {
             Echo($"[AutoMine] Path loaded ({pathGPS.Count} points).");
         }
     }
-} 
+}
+
+void SavePathSnapshotToCustomData(string pathMessage)
+{
+    MyIni ini = new MyIni();
+    ini.TryParse(Me.CustomData);
+    ini.Set(SNAPSHOT_SECTION, SNAPSHOT_PATH_KEY, pathMessage);
+    Me.CustomData = ini.ToString();
+}
+
+bool LoadPathSnapshotFromCustomData()
+{
+    MyIni ini = new MyIni();
+    if (!ini.TryParse(Me.CustomData)) return false;
+    string cached = ini.Get(SNAPSHOT_SECTION, SNAPSHOT_PATH_KEY).ToString();
+    if (string.IsNullOrWhiteSpace(cached) || !cached.StartsWith("Path|", StringComparison.OrdinalIgnoreCase)) return false;
+    HandlePathMessage(cached);
+    return true;
+}
+
+void HandleAsteroidSnapshotMessage(string msg)
+{
+    int firstSep = msg.IndexOf('|');
+    if (firstSep < 0 || firstSep + 1 >= msg.Length) return;
+    string payload = msg.Substring(firstSep + 1);
+    if (string.IsNullOrWhiteSpace(payload)) return;
+    SavePathSnapshotToCustomData(payload);
+    if (LoadPathSnapshotFromCustomData()) Echo("[AutoMine] Snapshot saved to CustomData and loaded.");
+}
 
 void StartAutomine() {
     autominePendingPath = true;
     autominePathIndex = 0;
     automineStartAfterUndock = undockActive || undockToEntryActive;
-    BroadcastCarrier("PathfinderReturnRequest");
-    Echo("[AutoMine] Requested path from Ca.");
+    BroadcastCarrier("ActiveAsteroidSnapshotRequest");
+    Echo("[AutoMine] Requested active asteroid snapshot from Ca.");
+    if (!LoadPathSnapshotFromCustomData())
+        Echo("[AutoMine] No cached snapshot found yet. Waiting for Ca.");
 }
 
 void StopAutomine(bool clearPending) {

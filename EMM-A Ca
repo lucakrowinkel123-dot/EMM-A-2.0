@@ -86,6 +86,11 @@ public void Main(string argument, UpdateType updateSource)
         SendLiveDockData();
         return;
     }
+    if (argument.Equals("ActiveAsteroidSnapshotRequest", StringComparison.OrdinalIgnoreCase))
+    {
+        SendActiveAsteroidSnapshot();
+        return;
+    }
     if (argument.Equals("Reset", StringComparison.OrdinalIgnoreCase))
     {
         ResetCarrierState();
@@ -720,6 +725,7 @@ void ProcessPathfinderMessage(string s)
     if (s.StartsWith("ExcavationSiteCancel", StringComparison.OrdinalIgnoreCase)) { Main("ExcavationSiteCancel", UpdateType.Script); return; }
     if (s.Equals("PathfinderMaxSpeedRequest", StringComparison.OrdinalIgnoreCase)) { Main("PathfinderMaxSpeedRequest", UpdateType.Script); return; }
     if (s.Equals("LiveDockDataRequest", StringComparison.OrdinalIgnoreCase)) { Main("LiveDockDataRequest", UpdateType.Script); return; }
+    if (s.Equals("ActiveAsteroidSnapshotRequest", StringComparison.OrdinalIgnoreCase)) { Main("ActiveAsteroidSnapshotRequest", UpdateType.Script); return; }
     if (s.Equals("PathfinderReturnRequest", StringComparison.OrdinalIgnoreCase)) { Main("PathfinderReturnRequest", UpdateType.Script); return; }
     if (s.Equals("AsteroidSetUpComplete", StringComparison.OrdinalIgnoreCase)) { Main("AsteroidSetUpComplete", UpdateType.Script); return; }
     if (s.Equals("Reset", StringComparison.OrdinalIgnoreCase)) { Main("Reset", UpdateType.Script); return; }
@@ -748,20 +754,38 @@ void UndoLastExcavationSitePath()
 // Builds and broadcasts the full return path with gps/orient/close for each point
 void SendReturnPath()
 {
+    string route;
+    if (!TryBuildReturnPathRoute(out route)) return;
+    BroadcastPathfinder("Path|" + route);
+    Echo("Sent: Path|" + route);
+}
+
+void SendActiveAsteroidSnapshot()
+{
+    string route;
+    if (!TryBuildReturnPathRoute(out route)) return;
+    string payload = "Path|" + route;
+    BroadcastPathfinder("ActiveAsteroidSnapshot|" + payload);
+    Echo("Sent: ActiveAsteroidSnapshot|" + payload);
+}
+
+bool TryBuildReturnPathRoute(out string route)
+{
+    route = "";
     MyIni ini; string section;
-    if (!GetCurrentAsteroidIni(out ini, out section)) { Echo("No asteroid setup."); return; }
+    if (!GetCurrentAsteroidIni(out ini, out section)) { Echo("No asteroid setup."); return false; }
     int n = Math.Max(1, currentSiteN - 1);
     if (!ini.ContainsKey(section, $"ExcavationSite{n}") &&
         !ini.ContainsKey(section, $"ExcavationSiteStagger{n}") &&
         !ini.ContainsKey(section, $"ExcavationSitePath{n}_1"))
     {
         Echo("No site data.");
-        return;
+        return false;
     }
 
     // Read close distances from field DB Settings
     MyIni fieldIni = new MyIni();
-    if (!fieldIni.TryParse(fieldDatabase.CustomData)) { Echo("Bad field DB ini."); return; }
+    if (!fieldIni.TryParse(fieldDatabase.CustomData)) { Echo("Bad field DB ini."); return false; }
     double entryClose = fieldIni.Get("Settings", "EntryCloseDistance").ToDouble(0.5);
     double pathClose = fieldIni.Get("Settings", "PathCloseDistance").ToDouble(2.5);
     double staggerClose = fieldIni.Get("Settings", "StaggerCloseDistance").ToDouble(0.5);
@@ -815,9 +839,8 @@ void SendReturnPath()
         all.Add(closeList[i]);
     }
 
-    string route = string.Join("|", all);
-    BroadcastPathfinder("Path|" + route);
-    Echo("Sent: Path|" + route);
+    route = string.Join("|", all);
+    return true;
 }
 
 // --- PATHFINDER MAX SPEED BROADCAST ---
