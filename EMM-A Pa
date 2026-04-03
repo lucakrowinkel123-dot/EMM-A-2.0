@@ -4,9 +4,10 @@ const string INDICATOR_NAME = "EMM-A PF Indicator Light";
 const string SOUND_BLOCK_NAME = "EMM-A PF Sound Block"; 
 const string SENSOR_TAG = "EMM-A PF Sensor"; // Ensure your sensor has this name
 const string PATHFINDER_CHANNEL = "EMM-A Ca_PathFinder_Channel"; 
-const string PATHFINDER_CHANNEL_LEGACY = "ANOUK-Ca_PathFinder_Channel";
 const string REMOTE_TAG = "EMM-A PF Remote Control"; 
 const string CONNECTOR_TAG = "EMM-A PF Connector";
+const string SNAPSHOT_SECTION = "PFPathCache";
+const string SNAPSHOT_PATH_KEY = "PathMessage";
 const double CLOSE_ENOUGH_DEFAULT = 1.0; 
 
 // PID TUNING FOR STABILITY
@@ -16,6 +17,13 @@ IMyTextPanel lcdPath; IMyTextPanel lcdConfirm; IMyLightingBlock indicatorLight; 
 IMySensorBlock sensor; // Added sensor reference
 IMyShipConnector connector;
 GyroControl gyroControl;
+List<IMyThrust> cachedThrusters = new List<IMyThrust>();
+List<IMyGyro> cachedGyros = new List<IMyGyro>();
+int blockRefreshTicker = 999;
+const int BLOCK_REFRESH_INTERVAL_TICKS = 60; // Update10 -> ~10s
+const double THRUST_GAIN_PER_KG = 1.5;
+const double THRUST_GAIN_MIN = 90000;
+const double THRUST_GAIN_MAX = 450000;
 
 bool blinkRequested = false; int blinkTicks = 0; Color blinkColor = new Color(0, 255, 0); 
 bool hasEntry1Target = false;
@@ -91,23 +99,12 @@ const double UNDO_RETURN_POINT_CLOSE = 0.5;
 public Program() { 
     Runtime.UpdateFrequency = UpdateFrequency.Update10; 
     IGC.RegisterBroadcastListener(PATHFINDER_CHANNEL); 
-    IGC.RegisterBroadcastListener(PATHFINDER_CHANNEL_LEGACY);
 } 
 
 public void Main(string argument, UpdateType updateSource) { 
-    lcdPath = GridTerminalSystem.GetBlockWithName(LCD_PATH_NAME) as IMyTextPanel; 
-    lcdConfirm = GridTerminalSystem.GetBlockWithName(LCD_CONFIRM_NAME) as IMyTextPanel; 
-    indicatorLight = GridTerminalSystem.GetBlockWithName(INDICATOR_NAME) as IMyLightingBlock; 
-    remote = GridTerminalSystem.GetBlockWithName(REMOTE_TAG) as IMyRemoteControl; 
-    sensor = GridTerminalSystem.GetBlockWithName(SENSOR_TAG) as IMySensorBlock; // Initialize sensor
-    soundBlock = GridTerminalSystem.GetBlockWithName(SOUND_BLOCK_NAME) as IMySoundBlock; 
-    connector = GridTerminalSystem.GetBlockWithName(CONNECTOR_TAG) as IMyShipConnector;
-
-    if (remote != null && gyroControl == null) {
-        List<IMyGyro> gyros = new List<IMyGyro>();
-        GridTerminalSystem.GetBlocksOfType(gyros);
-        gyroControl = new GyroControl(remote, gyros);
-    }
+    bool forceRefresh = blockRefreshTicker >= BLOCK_REFRESH_INTERVAL_TICKS || remote == null || gyroControl == null;
+    RefreshBlocks(forceRefresh);
+    blockRefreshTicker++;
 
     double deltaTime = Runtime.TimeSinceLastRun.TotalSeconds; 
     string cmd = (argument ?? "").Trim(); 
@@ -129,11 +126,9 @@ public void Main(string argument, UpdateType updateSource) {
             Echo("Step 2: A Set. Go to B.");
         } else if (setupStep == 3) {
             setupPos2 = remote.GetPosition();
-            double y, p, r; GetRotationAngles(lockedMatrix.Forward, lockedMatrix.Up, out y, out p, out r);
-            string orient = $"{y:F2},{p:F2},{r:F2}";
             string gpsA = $"GPS:CornerA:{setupPos1.X:F2}:{setupPos1.Y:F2}:{setupPos1.Z:F2}:";
             string gpsB = $"GPS:CornerB:{setupPos2.X:F2}:{setupPos2.Y:F2}:{setupPos2.Z:F2}:";
-            string msg = $"ExcavationSiteSetUpComplete|{orient}|{gpsA}|{gpsB}";
+            string msg = $"ExcavationSiteSetUpComplete|{gpsA}|{gpsB}";
             BroadcastCarrier(msg);
             Echo($"Sent Setup: {msg}");
             autoReturnHoldForward = lockedMatrix.Forward;
@@ -189,8 +184,7 @@ public void Main(string argument, UpdateType updateSource) {
     else if (cmd.Equals("PF_AutoMineStart", StringComparison.OrdinalIgnoreCase)) { StartAutomine(); return; }
     else if (cmd.Equals("PF_AutoMineStop", StringComparison.OrdinalIgnoreCase)) { StopAutomine(true); return; }
     else if (cmd.Equals("PF_Dock", StringComparison.OrdinalIgnoreCase)) {
-        pendingDockStart = true;
-        BroadcastCarrier("LiveDockDataRequest");
+        BeginDockSequence();
         return;
     }
     else if (CmdIs(cmd, "EMMA_ReturnRequest", "PF_ReturnRequest")) { commandPrefix = "PathfinderReturnRequest"; isSendCommand = true; } 
@@ -233,6 +227,7 @@ public void Main(string argument, UpdateType updateSource) {
             if (str != null) { 
                 if (str.StartsWith("Confirmed_Entry|")) HandleConfirmedEntry(str); 
                 else if (str.StartsWith("Path|")) HandlePathMessage(str); 
+                else if (str.StartsWith("ActiveAsteroidSnapshot|")) HandleAsteroidSnapshotMessage(str);
                 else if (str.StartsWith("PathfinderMaxSpeed|")) HandleMaxSpeed(str); 
                 else if (str.StartsWith("LiveDockData|")) HandleLiveDockData(str);
             } 
@@ -269,6 +264,7 @@ public void Main(string argument, UpdateType updateSource) {
         } 
     } 
     OutputPathStatus(); 
+    PrintDebugState();
 } 
 
 bool CmdIs(string cmd, string primary, string legacy) {
@@ -294,6 +290,69 @@ void ConfigureSensorVisuals(bool active) {
     }
 }
 
+void RefreshBlocks(bool force)
+{
+    if (!force) return;
+    blockRefreshTicker = 0;
+    lcdPath = GridTerminalSystem.GetBlockWithName(LCD_PATH_NAME) as IMyTextPanel;
+    lcdConfirm = GridTerminalSystem.GetBlockWithName(LCD_CONFIRM_NAME) as IMyTextPanel;
+    indicatorLight = GridTerminalSystem.GetBlockWithName(INDICATOR_NAME) as IMyLightingBlock;
+    remote = GridTerminalSystem.GetBlockWithName(REMOTE_TAG) as IMyRemoteControl;
+    sensor = GridTerminalSystem.GetBlockWithName(SENSOR_TAG) as IMySensorBlock;
+    soundBlock = GridTerminalSystem.GetBlockWithName(SOUND_BLOCK_NAME) as IMySoundBlock;
+    connector = GridTerminalSystem.GetBlockWithName(CONNECTOR_TAG) as IMyShipConnector;
+    cachedThrusters.Clear();
+    cachedGyros.Clear();
+    GridTerminalSystem.GetBlocksOfType(cachedThrusters);
+    GridTerminalSystem.GetBlocksOfType(cachedGyros);
+    gyroControl = remote != null ? new GyroControl(remote, cachedGyros) : null;
+}
+
+double GetThrustGain()
+{
+    if (remote == null) return THRUST_GAIN_MIN;
+    double mass = remote.CalculateShipMass().PhysicalMass;
+    return MathHelper.Clamp(mass * THRUST_GAIN_PER_KG, THRUST_GAIN_MIN, THRUST_GAIN_MAX);
+}
+
+void ApplyVelocityError(Vector3D velErr)
+{
+    double gain = GetThrustGain();
+    foreach (var t in cachedThrusters) {
+        Vector3D accelDir = -t.WorldMatrix.Forward;
+        double thrustDemand = Vector3D.Dot(velErr, accelDir);
+        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * gain) : 0f;
+    }
+}
+
+void PrintDebugState()
+{
+    var states = new List<string>();
+    if (isSoftLocked) states.Add("SoftLock");
+    if (autoReturnToStaggerActive) states.Add("AutoReturnStagger");
+    if (undoReturnActive) states.Add("UndoReturn");
+    if (undockActive) states.Add("UndockStraight");
+    if (undockToEntryActive) states.Add("UndockToEntry");
+    if (dockStraightActive) states.Add("DockStage");
+    if (dockActive) states.Add("DockFinal");
+    if (automineActive) states.Add("AutoMine");
+    if (autominePendingPath) states.Add("AwaitingPath");
+    if (recordingActive) states.Add(recordingPaused ? "RecordingPaused" : "Recording");
+    if (states.Count == 0) states.Add("Idle");
+    string txt =
+        $"State: {string.Join(", ", states)}\n" +
+        $"SetupStep: {setupStep}\n" +
+        $"PathIdx: {autominePathIndex}/{pathGPS.Count}\n" +
+        $"Entry1: {(hasEntry1Target ? "Yes" : "No")}, Connector: {(hasLiveConnectorTarget ? "Yes" : "No")}\n" +
+        $"Thrusters: {cachedThrusters.Count}, Gyros: {cachedGyros.Count}\n" +
+        $"Runtime: {Runtime.LastRunTimeMs:0.000} ms";
+    Echo(txt);
+    var surface = Me.GetSurface(0);
+    surface.ContentType = ContentType.TEXT_AND_IMAGE;
+    surface.FontSize = 0.85f;
+    surface.WriteText(txt);
+}
+
 // ... [Remainder of your GyroControl, PID, and Helper classes/methods stay exactly the same] ...
 
 void ApplySoftLock(double dt) {
@@ -307,10 +366,10 @@ void ApplySoftLock(double dt) {
         double cVel = Vector3D.Dot(remote.GetShipVelocities().LinearVelocity, remote.WorldMatrix.Forward);
         double tVel = MathHelper.Clamp((fwdErr / 5.0) * 2.0, -3.0, 3.0);
         double vErr = tVel - cVel;
-        List<IMyThrust> thrusters = new List<IMyThrust>(); GridTerminalSystem.GetBlocksOfType(thrusters);
-        foreach (var t in thrusters) {
-            if (Vector3D.Dot(t.WorldMatrix.Forward, remote.WorldMatrix.Backward) > 0.9) t.ThrustOverride = vErr > 0.05 ? (float)(vErr * 180000) : 0;
-            if (Vector3D.Dot(t.WorldMatrix.Forward, remote.WorldMatrix.Forward) > 0.9) t.ThrustOverride = vErr < -0.05 ? (float)(Math.Abs(vErr) * 180000) : 0;
+        double gain = GetThrustGain();
+        foreach (var t in cachedThrusters) {
+            if (Vector3D.Dot(t.WorldMatrix.Forward, remote.WorldMatrix.Backward) > 0.9) t.ThrustOverride = vErr > 0.05 ? (float)(vErr * gain) : 0;
+            if (Vector3D.Dot(t.WorldMatrix.Forward, remote.WorldMatrix.Forward) > 0.9) t.ThrustOverride = vErr < -0.05 ? (float)(Math.Abs(vErr) * gain) : 0;
         }
     } else StopThrusterOverrides();
 }
@@ -351,13 +410,7 @@ void ApplyAutoReturnToStagger(double dt) {
         desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 4.0, 0.4, AUTO_RETURN_MAX_SPEED);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
 
-    List<IMyThrust> thrusters = new List<IMyThrust>(); 
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 void StartRecordingMode() { recordingActive = true; recordingPaused = true; recordingTimer = 0; recordingLastGPS = remote != null ? remote.GetPosition() : Vector3D.Zero; SendPFExcavationSitePathAdd(); Echo("[Recording Mode] Started."); } 
@@ -387,6 +440,119 @@ void HandlePathMessage(string msg) {
         if (idx < parts.Length && double.TryParse(parts[idx], out closeEnough)) { pathCloseEnoughs.Add(closeEnough); idx++; } else { pathCloseEnoughs.Add(CLOSE_ENOUGH_DEFAULT); } 
     } 
     pathMaxSpeed = -1; BroadcastCarrier("PathfinderMaxSpeedRequest"); Echo("Path stored."); 
+    GenerateSweepFromSiteCorners();
+    SavePathSnapshotToCustomData(msg);
+    ActivateAutomineIfPathReady();
+} 
+
+void GenerateSweepFromSiteCorners()
+{
+    if (pathGPS.Count < 3 || pathGPSStrings.Count != pathGPS.Count || pathOrientations.Count != pathGPS.Count) return;
+
+    int idxA = -1, idxB = -1;
+    for (int i = 0; i < pathGPSStrings.Count; i++)
+    {
+        if (pathGPSStrings[i].StartsWith("GPS:CornerA:", StringComparison.OrdinalIgnoreCase)) idxA = i;
+        if (pathGPSStrings[i].StartsWith("GPS:CornerB:", StringComparison.OrdinalIgnoreCase)) idxB = i;
+    }
+    if (idxA < 0 || idxB < 0) return;
+    if (idxA > idxB) { int t = idxA; idxA = idxB; idxB = t; }
+
+    Vector3D cornerA = pathGPS[idxA];
+    Vector3D cornerB = pathGPS[idxB];
+    Vector3D stagger = pathGPS[0];
+    Vector3D edge = cornerB - cornerA;
+    if (edge.LengthSquared() < 1e-6) return;
+    Vector3D edgeN = Vector3D.Normalize(edge);
+
+    Vector3D mid = (cornerA + cornerB) * 0.5;
+    Vector3D inward = stagger - mid;
+    inward = inward - edgeN * Vector3D.Dot(inward, edgeN);
+    if (inward.LengthSquared() < 1e-6) return;
+    Vector3D inwardN = Vector3D.Normalize(inward);
+    double depth = inward.Length();
+    if (depth < 2.0) return;
+
+    double step = GetMinerSweepStep(inwardN);
+    if (step < 1.0) step = 1.0;
+    int lanes = Math.Max(1, (int)Math.Ceiling(depth / step));
+
+    string orient = pathOrientations[idxA];
+    double close = idxA < pathCloseEnoughs.Count ? pathCloseEnoughs[idxA] : CLOSE_ENOUGH_DEFAULT;
+
+    var newGps = new List<Vector3D>();
+    var newGpsStrings = new List<string>();
+    var newOrients = new List<string>();
+    var newClose = new List<double>();
+
+    // Keep approach points before CornerA.
+    for (int i = 0; i < idxA; i++) {
+        newGps.Add(pathGPS[i]);
+        newGpsStrings.Add(pathGPSStrings[i]);
+        newOrients.Add(pathOrientations[i]);
+        newClose.Add(i < pathCloseEnoughs.Count ? pathCloseEnoughs[i] : CLOSE_ENOUGH_DEFAULT);
+    }
+
+    // Snake lanes.
+    for (int lane = 0; lane <= lanes; lane++)
+    {
+        double offset = Math.Min(depth, lane * step);
+        Vector3D a = cornerA + inwardN * offset;
+        Vector3D b = cornerB + inwardN * offset;
+        if (lane % 2 == 0) {
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, a, orient, close, "Sweep");
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, b, orient, close, "Sweep");
+        } else {
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, b, orient, close, "Sweep");
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, a, orient, close, "Sweep");
+        }
+    }
+
+    // Border cleanup pass: right edge then underside edge with overlap.
+    Vector3D rightTop = cornerB;
+    Vector3D rightBottom = cornerB + inwardN * depth;
+    Vector3D bottomLeft = cornerA + inwardN * depth;
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, rightTop, orient, close, "Border");
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, rightBottom, orient, close, "Border");
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, bottomLeft, orient, close, "Border");
+
+    pathGPS = newGps;
+    pathGPSStrings = newGpsStrings;
+    pathOrientations = newOrients;
+    pathCloseEnoughs = newClose;
+    Echo($"[AutoMine] Generated sweep lanes: {lanes + 1}, total pts: {pathGPS.Count}");
+}
+
+double GetMinerSweepStep(Vector3D stepDir)
+{
+    if (remote == null) return 5.0;
+    List<IMyShipDrill> drills = new List<IMyShipDrill>();
+    GridTerminalSystem.GetBlocksOfType(drills, d => d.CubeGrid == remote.CubeGrid);
+    if (drills.Count == 0) return 5.0;
+
+    Vector3D center = GetDrillCenterOrRemote();
+    double min = double.MaxValue, max = double.MinValue;
+    foreach (var d in drills)
+    {
+        double t = Vector3D.Dot(d.GetPosition() - center, stepDir);
+        if (t < min) min = t;
+        if (t > max) max = t;
+    }
+    double span = max - min;
+    if (span < 0.5) span = 5.0;
+    return Math.Max(1.0, span * 0.75); // overlap by ~25%
+}
+
+void AddSweepPoint(List<Vector3D> gps, List<string> gpsStrings, List<string> orients, List<double> closes, Vector3D p, string orient, double close, string label)
+{
+    gps.Add(p);
+    gpsStrings.Add($"GPS:{label}:{p.X:F2}:{p.Y:F2}:{p.Z:F2}:");
+    orients.Add(orient);
+    closes.Add(close);
+}
+
+void ActivateAutomineIfPathReady()
+{
     if (autominePendingPath && pathGPS.Count > 0) {
         autominePendingPath = false;
         bool firstIsEntry = pathGPSStrings.Count > 0 && pathGPSStrings[0].StartsWith("GPS:Entry:", StringComparison.OrdinalIgnoreCase);
@@ -399,14 +565,46 @@ void HandlePathMessage(string msg) {
             Echo($"[AutoMine] Path loaded ({pathGPS.Count} points).");
         }
     }
-} 
+}
+
+void SavePathSnapshotToCustomData(string pathMessage)
+{
+    MyIni ini = new MyIni();
+    ini.TryParse(Me.CustomData);
+    ini.Set(SNAPSHOT_SECTION, SNAPSHOT_PATH_KEY, pathMessage);
+    Me.CustomData = ini.ToString();
+}
+
+bool LoadPathSnapshotFromCustomData()
+{
+    MyIni ini = new MyIni();
+    if (!ini.TryParse(Me.CustomData)) return false;
+    string cached = ini.Get(SNAPSHOT_SECTION, SNAPSHOT_PATH_KEY).ToString();
+    if (string.IsNullOrWhiteSpace(cached) || !cached.StartsWith("Path|", StringComparison.OrdinalIgnoreCase)) return false;
+    HandlePathMessage(cached);
+    return true;
+}
+
+void HandleAsteroidSnapshotMessage(string msg)
+{
+    int firstSep = msg.IndexOf('|');
+    if (firstSep < 0 || firstSep + 1 >= msg.Length) return;
+    string payload = msg.Substring(firstSep + 1);
+    if (string.IsNullOrWhiteSpace(payload)) return;
+    SavePathSnapshotToCustomData(payload);
+    if (LoadPathSnapshotFromCustomData()) Echo("[AutoMine] Snapshot saved to CustomData and loaded.");
+}
 
 void StartAutomine() {
     autominePendingPath = true;
     autominePathIndex = 0;
-    automineStartAfterUndock = undockActive || undockToEntryActive;
-    BroadcastCarrier("PathfinderReturnRequest");
-    Echo("[AutoMine] Requested path from Ca.");
+    bool shouldUndock = connector != null && connector.Status == MyShipConnectorStatus.Connected;
+    if (shouldUndock) StartUndock();
+    automineStartAfterUndock = shouldUndock || undockActive || undockToEntryActive;
+    BroadcastCarrier("ActiveAsteroidSnapshotRequest");
+    Echo("[AutoMine] Requested active asteroid snapshot from Ca.");
+    if (!LoadPathSnapshotFromCustomData())
+        Echo("[AutoMine] No cached snapshot found yet. Waiting for Ca.");
 }
 
 void StopAutomine(bool clearPending) {
@@ -444,7 +642,12 @@ Vector3D GetDrillCenterOrRemote() {
 
 void ApplyAutomineFollow(double dt) {
     if (remote == null || !automineActive) return;
-    if (autominePathIndex >= pathGPS.Count) { StopAutomine(false); Echo("[AutoMine] Path complete."); return; }
+    if (autominePathIndex >= pathGPS.Count) {
+        StopAutomine(false);
+        Echo("[AutoMine] Path complete. Starting dock sequence.");
+        BeginDockSequence();
+        return;
+    }
     if (remote.MoveIndicator.LengthSquared() > 0.05f || remote.RotationIndicator.LengthSquared() > 0.05f || Math.Abs(remote.RollIndicator) > 0.05f) {
         StopAutomine(true);
         Echo("[AutoMine] Canceled by pilot input.");
@@ -469,13 +672,13 @@ void ApplyAutomineFollow(double dt) {
 
     Vector3D desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 4.0, 0.2, 1.8);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
+}
+
+void BeginDockSequence()
+{
+    pendingDockStart = true;
+    BroadcastCarrier("LiveDockDataRequest");
 }
 
 void OutputPathStatus() { 
@@ -575,13 +778,7 @@ void ApplyUndock(double dt) {
     double remaining = connectorApproachDistance - progress;
     Vector3D desiredVel = undockMoveDir * MathHelper.Clamp(remaining / 4.0, 0.4, 1.6);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 void ApplyUndockToEntry(double dt) {
@@ -621,13 +818,7 @@ void ApplyUndockToEntry(double dt) {
     if (distance > 0.01)
         desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 6.0, 0.3, 1.6);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 void StartDock()
@@ -673,13 +864,7 @@ void ApplyDockStraight(double dt)
 
     Vector3D desiredVel = Vector3D.Normalize(toStage) * MathHelper.Clamp(progress / 4.0, 0.25, 1.6);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 void ApplyDock(double dt)
@@ -725,13 +910,7 @@ void ApplyDock(double dt)
     if (distance > 0.01)
         desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 5.0, 0.15, 1.1);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 void BeginUndoAndReturn() {
@@ -801,13 +980,7 @@ void ApplyUndoAndReturn(double dt) {
         desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 4.0, 0.4, AUTO_RETURN_MAX_SPEED);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
 
-    List<IMyThrust> thrusters = new List<IMyThrust>();
-    GridTerminalSystem.GetBlocksOfType(thrusters);
-    foreach (var t in thrusters) {
-        Vector3D accelDir = -t.WorldMatrix.Forward;
-        double thrustDemand = Vector3D.Dot(velErr, accelDir);
-        t.ThrustOverride = thrustDemand > 0.05 ? (float)(thrustDemand * 180000) : 0f;
-    }
+    ApplyVelocityError(velErr);
 }
 
 bool TryParseOrientation(string orientation, out Vector3D forward, out Vector3D up) {
@@ -857,7 +1030,7 @@ void HandleLiveDockData(string msg)
 }
 
 void StopOverrides() { StopThrusterOverrides(); gyroControl?.Reset(); }
-void StopThrusterOverrides() { List<IMyThrust> t = new List<IMyThrust>(); GridTerminalSystem.GetBlocksOfType(t); foreach (var x in t) x.ThrustOverride = 0; }
+void StopThrusterOverrides() { foreach (var x in cachedThrusters) x.ThrustOverride = 0; }
 
 bool TryParseGPS(string gps, out Vector3D pos) { 
     pos = Vector3D.Zero; var p = gps.Split(':'); if (p.Length < 5) return false; 
@@ -878,7 +1051,6 @@ void GetRotationAngles(Vector3D forward, Vector3D up, out double yaw, out double
 
 void BroadcastCarrier(string message) {
     IGC.SendBroadcastMessage(PATHFINDER_CHANNEL, message);
-    IGC.SendBroadcastMessage(PATHFINDER_CHANNEL_LEGACY, message);
 }
 
 void ResetPathfinder(bool sendCarrierReset) {
