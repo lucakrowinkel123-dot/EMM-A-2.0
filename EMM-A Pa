@@ -126,11 +126,9 @@ public void Main(string argument, UpdateType updateSource) {
             Echo("Step 2: A Set. Go to B.");
         } else if (setupStep == 3) {
             setupPos2 = remote.GetPosition();
-            double y, p, r; GetRotationAngles(lockedMatrix.Forward, lockedMatrix.Up, out y, out p, out r);
-            string orient = $"{y:F2},{p:F2},{r:F2}";
             string gpsA = $"GPS:CornerA:{setupPos1.X:F2}:{setupPos1.Y:F2}:{setupPos1.Z:F2}:";
             string gpsB = $"GPS:CornerB:{setupPos2.X:F2}:{setupPos2.Y:F2}:{setupPos2.Z:F2}:";
-            string msg = $"ExcavationSiteSetUpComplete|{orient}|{gpsA}|{gpsB}";
+            string msg = $"ExcavationSiteSetUpComplete|{gpsA}|{gpsB}";
             BroadcastCarrier(msg);
             Echo($"Sent Setup: {msg}");
             autoReturnHoldForward = lockedMatrix.Forward;
@@ -186,8 +184,7 @@ public void Main(string argument, UpdateType updateSource) {
     else if (cmd.Equals("PF_AutoMineStart", StringComparison.OrdinalIgnoreCase)) { StartAutomine(); return; }
     else if (cmd.Equals("PF_AutoMineStop", StringComparison.OrdinalIgnoreCase)) { StopAutomine(true); return; }
     else if (cmd.Equals("PF_Dock", StringComparison.OrdinalIgnoreCase)) {
-        pendingDockStart = true;
-        BroadcastCarrier("LiveDockDataRequest");
+        BeginDockSequence();
         return;
     }
     else if (CmdIs(cmd, "EMMA_ReturnRequest", "PF_ReturnRequest")) { commandPrefix = "PathfinderReturnRequest"; isSendCommand = true; } 
@@ -443,9 +440,116 @@ void HandlePathMessage(string msg) {
         if (idx < parts.Length && double.TryParse(parts[idx], out closeEnough)) { pathCloseEnoughs.Add(closeEnough); idx++; } else { pathCloseEnoughs.Add(CLOSE_ENOUGH_DEFAULT); } 
     } 
     pathMaxSpeed = -1; BroadcastCarrier("PathfinderMaxSpeedRequest"); Echo("Path stored."); 
+    GenerateSweepFromSiteCorners();
     SavePathSnapshotToCustomData(msg);
     ActivateAutomineIfPathReady();
 } 
+
+void GenerateSweepFromSiteCorners()
+{
+    if (pathGPS.Count < 3 || pathGPSStrings.Count != pathGPS.Count || pathOrientations.Count != pathGPS.Count) return;
+
+    int idxA = -1, idxB = -1;
+    for (int i = 0; i < pathGPSStrings.Count; i++)
+    {
+        if (pathGPSStrings[i].StartsWith("GPS:CornerA:", StringComparison.OrdinalIgnoreCase)) idxA = i;
+        if (pathGPSStrings[i].StartsWith("GPS:CornerB:", StringComparison.OrdinalIgnoreCase)) idxB = i;
+    }
+    if (idxA < 0 || idxB < 0) return;
+    if (idxA > idxB) { int t = idxA; idxA = idxB; idxB = t; }
+
+    Vector3D cornerA = pathGPS[idxA];
+    Vector3D cornerB = pathGPS[idxB];
+    Vector3D stagger = pathGPS[0];
+    Vector3D edge = cornerB - cornerA;
+    if (edge.LengthSquared() < 1e-6) return;
+    Vector3D edgeN = Vector3D.Normalize(edge);
+
+    Vector3D mid = (cornerA + cornerB) * 0.5;
+    Vector3D inward = stagger - mid;
+    inward = inward - edgeN * Vector3D.Dot(inward, edgeN);
+    if (inward.LengthSquared() < 1e-6) return;
+    Vector3D inwardN = Vector3D.Normalize(inward);
+    double depth = inward.Length();
+    if (depth < 2.0) return;
+
+    double step = GetMinerSweepStep(inwardN);
+    if (step < 1.0) step = 1.0;
+    int lanes = Math.Max(1, (int)Math.Ceiling(depth / step));
+
+    string orient = pathOrientations[idxA];
+    double close = idxA < pathCloseEnoughs.Count ? pathCloseEnoughs[idxA] : CLOSE_ENOUGH_DEFAULT;
+
+    var newGps = new List<Vector3D>();
+    var newGpsStrings = new List<string>();
+    var newOrients = new List<string>();
+    var newClose = new List<double>();
+
+    // Keep approach points before CornerA.
+    for (int i = 0; i < idxA; i++) {
+        newGps.Add(pathGPS[i]);
+        newGpsStrings.Add(pathGPSStrings[i]);
+        newOrients.Add(pathOrientations[i]);
+        newClose.Add(i < pathCloseEnoughs.Count ? pathCloseEnoughs[i] : CLOSE_ENOUGH_DEFAULT);
+    }
+
+    // Snake lanes.
+    for (int lane = 0; lane <= lanes; lane++)
+    {
+        double offset = Math.Min(depth, lane * step);
+        Vector3D a = cornerA + inwardN * offset;
+        Vector3D b = cornerB + inwardN * offset;
+        if (lane % 2 == 0) {
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, a, orient, close, "Sweep");
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, b, orient, close, "Sweep");
+        } else {
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, b, orient, close, "Sweep");
+            AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, a, orient, close, "Sweep");
+        }
+    }
+
+    // Border cleanup pass: right edge then underside edge with overlap.
+    Vector3D rightTop = cornerB;
+    Vector3D rightBottom = cornerB + inwardN * depth;
+    Vector3D bottomLeft = cornerA + inwardN * depth;
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, rightTop, orient, close, "Border");
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, rightBottom, orient, close, "Border");
+    AddSweepPoint(newGps, newGpsStrings, newOrients, newClose, bottomLeft, orient, close, "Border");
+
+    pathGPS = newGps;
+    pathGPSStrings = newGpsStrings;
+    pathOrientations = newOrients;
+    pathCloseEnoughs = newClose;
+    Echo($"[AutoMine] Generated sweep lanes: {lanes + 1}, total pts: {pathGPS.Count}");
+}
+
+double GetMinerSweepStep(Vector3D stepDir)
+{
+    if (remote == null) return 5.0;
+    List<IMyShipDrill> drills = new List<IMyShipDrill>();
+    GridTerminalSystem.GetBlocksOfType(drills, d => d.CubeGrid == remote.CubeGrid);
+    if (drills.Count == 0) return 5.0;
+
+    Vector3D center = GetDrillCenterOrRemote();
+    double min = double.MaxValue, max = double.MinValue;
+    foreach (var d in drills)
+    {
+        double t = Vector3D.Dot(d.GetPosition() - center, stepDir);
+        if (t < min) min = t;
+        if (t > max) max = t;
+    }
+    double span = max - min;
+    if (span < 0.5) span = 5.0;
+    return Math.Max(1.0, span * 0.75); // overlap by ~25%
+}
+
+void AddSweepPoint(List<Vector3D> gps, List<string> gpsStrings, List<string> orients, List<double> closes, Vector3D p, string orient, double close, string label)
+{
+    gps.Add(p);
+    gpsStrings.Add($"GPS:{label}:{p.X:F2}:{p.Y:F2}:{p.Z:F2}:");
+    orients.Add(orient);
+    closes.Add(close);
+}
 
 void ActivateAutomineIfPathReady()
 {
@@ -494,7 +598,9 @@ void HandleAsteroidSnapshotMessage(string msg)
 void StartAutomine() {
     autominePendingPath = true;
     autominePathIndex = 0;
-    automineStartAfterUndock = undockActive || undockToEntryActive;
+    bool shouldUndock = connector != null && connector.Status == MyShipConnectorStatus.Connected;
+    if (shouldUndock) StartUndock();
+    automineStartAfterUndock = shouldUndock || undockActive || undockToEntryActive;
     BroadcastCarrier("ActiveAsteroidSnapshotRequest");
     Echo("[AutoMine] Requested active asteroid snapshot from Ca.");
     if (!LoadPathSnapshotFromCustomData())
@@ -536,7 +642,12 @@ Vector3D GetDrillCenterOrRemote() {
 
 void ApplyAutomineFollow(double dt) {
     if (remote == null || !automineActive) return;
-    if (autominePathIndex >= pathGPS.Count) { StopAutomine(false); Echo("[AutoMine] Path complete."); return; }
+    if (autominePathIndex >= pathGPS.Count) {
+        StopAutomine(false);
+        Echo("[AutoMine] Path complete. Starting dock sequence.");
+        BeginDockSequence();
+        return;
+    }
     if (remote.MoveIndicator.LengthSquared() > 0.05f || remote.RotationIndicator.LengthSquared() > 0.05f || Math.Abs(remote.RollIndicator) > 0.05f) {
         StopAutomine(true);
         Echo("[AutoMine] Canceled by pilot input.");
@@ -562,6 +673,12 @@ void ApplyAutomineFollow(double dt) {
     Vector3D desiredVel = Vector3D.Normalize(delta) * MathHelper.Clamp(distance / 4.0, 0.2, 1.8);
     Vector3D velErr = desiredVel - remote.GetShipVelocities().LinearVelocity;
     ApplyVelocityError(velErr);
+}
+
+void BeginDockSequence()
+{
+    pendingDockStart = true;
+    BroadcastCarrier("LiveDockDataRequest");
 }
 
 void OutputPathStatus() { 

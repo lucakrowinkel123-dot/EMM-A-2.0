@@ -600,14 +600,28 @@ void SaveExcavationSiteStagger(string arg)
     Main("SendConfirm", UpdateType.Script);
 }
 
-// Save completed site in the new format: orientation|cornerA|cornerB
+// Save completed site in the new format: cornerA|cornerB
 void SaveExcavationSite(string arg)
 {
     string[] parts = arg.Split('|');
-    if (parts.Length < 4) { Echo("Invalid ExcavationSiteSetUpComplete format. (Need orientation and 2 corners)"); return; }
-    string orientation = parts[1];
-    string cornerA = parts[2];
-    string cornerB = parts[3];
+    string cornerA, cornerB;
+    if (parts.Length >= 4)
+    {
+        // Legacy payload: ExcavationSiteSetUpComplete|orientation|cornerA|cornerB
+        cornerA = parts[2];
+        cornerB = parts[3];
+    }
+    else if (parts.Length >= 3)
+    {
+        // Preferred payload: ExcavationSiteSetUpComplete|cornerA|cornerB
+        cornerA = parts[1];
+        cornerB = parts[2];
+    }
+    else
+    {
+        Echo("Invalid ExcavationSiteSetUpComplete format. Need cornerA and cornerB.");
+        return;
+    }
 
     MyIni ini; string section; if (!GetCurrentAsteroidIni(out ini, out section)) return;
     int n = currentSiteN;
@@ -616,16 +630,16 @@ void SaveExcavationSite(string arg)
     string field = $"ExcavationSite{n}";
     if (ini.ContainsKey(section, field)) { Echo("Site already set."); return; }
 
-// Store as "orientation|cornerA|cornerB"
-ini.Set(section, field, orientation + "|" + cornerA + "|" + cornerB);
+// Store as "cornerA|cornerB"
+ini.Set(section, field, cornerA + "|" + cornerB);
 
 SetCurrentAsteroidIni(ini, section);
 
-Echo($"Set {field}: {orientation}|{cornerA}|{cornerB}");
+Echo($"Set {field}: {cornerA}|{cornerB}");
 
 lastConfirmedField = field;
 lastConfirmedGps = cornerA;
-lastConfirmedOrient = orientation;
+    lastConfirmedOrient = ini.Get(section, stagger).ToString().Split('|').Length > 1 ? ini.Get(section, stagger).ToString().Split('|')[1] : "";
 
 Main("SendConfirm", UpdateType.Script);
 
@@ -885,7 +899,8 @@ bool TryBuildReturnPathRoute(out string route)
     route = "";
     MyIni ini; string section;
     if (!GetSelectedAsteroidIni(out ini, out section)) { Echo("No selected asteroid."); return false; }
-    int n = Math.Max(1, currentSiteN - 1);
+    int n = GetLatestSiteIndex(ini, section);
+    if (n < 1) n = 1;
     if (!ini.ContainsKey(section, $"ExcavationSite{n}") &&
         !ini.ContainsKey(section, $"ExcavationSiteStagger{n}") &&
         !ini.ContainsKey(section, $"ExcavationSitePath{n}_1"))
@@ -938,8 +953,45 @@ bool TryBuildReturnPathRoute(out string route)
 
     if (!string.IsNullOrWhiteSpace(entry)) addPoint(entry, entryClose);
 
-    // Add final site as the end-point, if it exists
-    if (!string.IsNullOrWhiteSpace(site)) addPoint(site, siteClose);
+    // Add final site as end-point(s):
+    // Preferred format is "cornerA|cornerB"
+    // Legacy format may still be "orientation|cornerA|cornerB" or "gps|orientation"
+    if (!string.IsNullOrWhiteSpace(site))
+    {
+        var siteSplit = site.Split('|');
+        if (siteSplit.Length == 2)
+        {
+            string cornerA = siteSplit[0];
+            string cornerB = siteSplit[1];
+            string staggerGps = "";
+            if (!string.IsNullOrWhiteSpace(stagger))
+            {
+                var staggerSplit = stagger.Split('|');
+                if (staggerSplit.Length > 0) staggerGps = staggerSplit[0];
+            }
+            string derivedOrient;
+            if (!TryBuildSiteOrientationFromCorners(staggerGps, cornerA, cornerB, out derivedOrient))
+            {
+                double y, p, r;
+                GetRotationAngles(remote.WorldMatrix.Forward, remote.WorldMatrix.Up, out y, out p, out r);
+                derivedOrient = $"{y:F2},{p:F2},{r:F2}";
+            }
+            addPoint(cornerA + "|" + derivedOrient, siteClose);
+            addPoint(cornerB + "|" + derivedOrient, siteClose);
+        }
+        else if (siteSplit.Length >= 3)
+        {
+            string orient = siteSplit[0];
+            string cornerA = siteSplit[1];
+            string cornerB = siteSplit[2];
+            addPoint(cornerA + "|" + orient, siteClose);
+            addPoint(cornerB + "|" + orient, siteClose);
+        }
+        else
+        {
+            addPoint(site, siteClose);
+        }
+    }
 
     // Flatten to Path|<gps>|<orient>|<close>|...
     List<string> all = new List<string>();
@@ -951,6 +1003,60 @@ bool TryBuildReturnPathRoute(out string route)
     }
 
     route = string.Join("|", all);
+    return true;
+}
+
+int GetLatestSiteIndex(MyIni ini, string section)
+{
+    int latest = 0;
+    for (int i = 1; i <= 99; i++)
+    {
+        bool hasAny =
+            ini.ContainsKey(section, $"ExcavationSite{i}") ||
+            ini.ContainsKey(section, $"ExcavationSiteStagger{i}") ||
+            ini.ContainsKey(section, $"ExcavationSitePath{i}_1");
+        if (!hasAny) break;
+        latest = i;
+    }
+    return latest;
+}
+
+bool TryBuildSiteOrientationFromCorners(string staggerGps, string cornerAGps, string cornerBGps, out string orient)
+{
+    orient = "";
+    Vector3D staggerPos, aPos, bPos;
+    if (!TryParseGpsPosition(staggerGps, out staggerPos)) return false;
+    if (!TryParseGpsPosition(cornerAGps, out aPos)) return false;
+    if (!TryParseGpsPosition(cornerBGps, out bPos)) return false;
+
+    Vector3D edge = bPos - aPos;
+    if (edge.LengthSquared() < 1e-6) return false;
+    Vector3D edgeN = Vector3D.Normalize(edge);
+
+    Vector3D mid = (aPos + bPos) * 0.5;
+    Vector3D toStagger = staggerPos - mid;
+    Vector3D forward = toStagger - edgeN * Vector3D.Dot(toStagger, edgeN);
+    if (forward.LengthSquared() < 1e-6) return false;
+    forward.Normalize();
+
+    Vector3D up = edgeN;
+    double yaw, pitch, roll;
+    GetRotationAngles(forward, up, out yaw, out pitch, out roll);
+    orient = $"{yaw:F2},{pitch:F2},{roll:F2}";
+    return true;
+}
+
+bool TryParseGpsPosition(string gps, out Vector3D pos)
+{
+    pos = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(gps)) return false;
+    var parts = gps.Split(':');
+    if (parts.Length < 6) return false;
+    double x, y, z;
+    if (!double.TryParse(parts[2], out x)) return false;
+    if (!double.TryParse(parts[3], out y)) return false;
+    if (!double.TryParse(parts[4], out z)) return false;
+    pos = new Vector3D(x, y, z);
     return true;
 }
 
